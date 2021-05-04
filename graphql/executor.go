@@ -153,6 +153,24 @@ func PrepareQuery(ctx context.Context, typ Type, selectionSet *SelectionSet) err
 		if selectionSet == nil {
 			return NewClientError("object field must have selections")
 		}
+
+		for _, fragment := range selectionSet.Fragments {
+			if !typ.IsInterface {
+				if err := PrepareQuery(ctx, typ, fragment.SelectionSet); err != nil {
+					return err
+				}
+			}
+
+			for typString, graphqlTyp := range typ.PossibleTypes {
+				if fragment.On != typString {
+					continue
+				}
+				if err := PrepareQuery(ctx, graphqlTyp, fragment.SelectionSet); err != nil {
+					return err
+				}
+			}
+		}
+
 		for _, selection := range selectionSet.Selections {
 			if selection.Name == "__typename" {
 				if !isNilArgs(selection.UnparsedArgs) {
@@ -160,6 +178,9 @@ func PrepareQuery(ctx context.Context, typ Type, selectionSet *SelectionSet) err
 				}
 				if selection.SelectionSet != nil {
 					return NewClientError(`scalar field "__typename" must have no selection`)
+				}
+				for _, fragment := range selectionSet.Fragments {
+					fragment.SelectionSet.Selections = append(fragment.SelectionSet.Selections, selection)
 				}
 				continue
 			}
@@ -185,11 +206,7 @@ func PrepareQuery(ctx context.Context, typ Type, selectionSet *SelectionSet) err
 				return err
 			}
 		}
-		for _, fragment := range selectionSet.Fragments {
-			if err := PrepareQuery(ctx, typ, fragment.SelectionSet); err != nil {
-				return err
-			}
-		}
+
 		return nil
 
 	case *List:

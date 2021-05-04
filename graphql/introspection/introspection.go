@@ -126,8 +126,11 @@ var skipDirective = Directive{
 func (s *introspection) registerType(schema *schemabuilder.Schema) {
 	object := schema.Object("__Type", Type{})
 	object.FieldFunc("kind", func(t Type) TypeKind {
-		switch t.Inner.(type) {
+		switch v := t.Inner.(type) {
 		case *graphql.Object:
+			if v.IsInterface {
+				return INTERFACE
+			}
 			return OBJECT
 		case *graphql.Union:
 			return UNION
@@ -174,9 +177,32 @@ func (s *introspection) registerType(schema *schemabuilder.Schema) {
 		}
 	})
 
-	object.FieldFunc("interfaces", func() []Type { return nil })
+	object.FieldFunc("interfaces", func(t Type) []Type {
+		switch t := t.Inner.(type) {
+		case *graphql.Object:
+			if t.IsInterface {
+				return nil
+			}
+			var out []Type
+			for _, v := range t.Interfaces {
+				out = append(out, Type{Inner: v})
+			}
+			return out
+		}
+		return nil
+	})
 	object.FieldFunc("possibleTypes", func(t Type) []Type {
 		switch t := t.Inner.(type) {
+		case *graphql.Object:
+			if !t.IsInterface {
+				return nil
+			}
+			var out []Type
+			for _, v := range t.PossibleTypes {
+				out = append(out, Type{Inner: v})
+			}
+			return out
+
 		case *graphql.Union:
 			types := make([]Type, 0, len(t.Types))
 			for _, typ := range t.Types {
@@ -384,6 +410,9 @@ func BareIntrospectionSchema(schema *graphql.Schema) *graphql.Schema {
 	collectTypes(schema.Query, types)
 	collectTypes(schema.Mutation, types)
 	for _, obj := range schema.Objects {
+		collectTypes(obj, types)
+	}
+	for _, obj := range schema.Ifaces {
 		collectTypes(obj, types)
 	}
 

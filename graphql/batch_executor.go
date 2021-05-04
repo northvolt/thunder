@@ -421,10 +421,14 @@ func resolveObjectBatch(ctx context.Context, sources []interface{}, typ *Object,
 	numExpensive := 0
 	numNonExpensive := 0
 	for _, selection := range selections {
-		field, ok := typ.Fields[selection.Name]
-		if !ok {
+		field, err := selectField(typ, selection)
+		if err != nil {
 			continue
 		}
+		if !useSelection(typ, sources[0], selection) {
+			continue
+		}
+
 		if shouldUseBatch(ctx, field) {
 			numNonExpensive++
 			continue
@@ -469,6 +473,10 @@ func resolveObjectBatch(ctx context.Context, sources []interface{}, typ *Object,
 			continue
 		}
 
+		if !useSelection(typ, sources[0], selection) {
+			continue
+		}
+
 		if ok, err := ShouldIncludeNode(selection.Directives); err != nil {
 			return nil, nestPathError(selection.Alias, err)
 		} else if !ok {
@@ -482,7 +490,10 @@ func resolveObjectBatch(ctx context.Context, sources []interface{}, typ *Object,
 			destMap[selection.Alias] = filler
 		}
 
-		field := typ.Fields[selection.Name]
+		field, err := selectField(typ, selection)
+		if err != nil {
+			return nil, fmt.Errorf("select field: %w", err)
+		}
 		unit := &WorkUnit{
 			Ctx:          ctx,
 			field:        field,
@@ -552,4 +563,42 @@ func resolveObjectBatch(ctx context.Context, sources []interface{}, typ *Object,
 // based on the field information.
 func shouldUseBatch(ctx context.Context, field *Field) bool {
 	return field.Batch && field.UseBatchFunc(ctx)
+}
+
+func useSelection(typ *Object, source interface{}, s *Selection) bool {
+	if typ.Name == s.ParentType {
+		return true
+	}
+
+	t := reflect.TypeOf(source)
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	for name, obj := range typ.PossibleTypes {
+		if obj.Type == t {
+			return s.ParentType == name
+		}
+	}
+	return false
+}
+
+func selectField(typ *Object, selection *Selection) (*Field, error) {
+	if selection.ParentType == typ.Name {
+		f, ok := typ.Fields[selection.Name]
+		if !ok {
+			return nil, fmt.Errorf("no field %s found on %s", selection.Name, typ.Name)
+		}
+		return f, nil
+	}
+
+	// If we get here, the selection is on an interface.
+	selectedType, ok := typ.PossibleTypes[selection.ParentType]
+	if !ok {
+		return nil, fmt.Errorf("selection parent type %s invalid for %s", selectedType.Name, typ.Name)
+	}
+	f, ok := selectedType.Fields[selection.Name]
+	if !ok {
+		return nil, fmt.Errorf("no field %s found on %s", selection.Name, selectedType.Name)
+	}
+	return f, nil
 }

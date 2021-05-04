@@ -17,13 +17,41 @@ const federationName = "Federation"
 type Schema struct {
 	Name      string
 	objects   map[string]*Object
+	ifaces    map[string]*Object
 	enumTypes map[reflect.Type]*EnumMapping
+
+	scalars       map[reflect.Type]string
+	ifaceStrategy IfaceStrategy
+}
+
+// SchemaOption specifies functionality for the schema.
+type SchemaOption func(*Schema)
+
+// WithIfaceStrategy specifies the strategy that should be used
+// to translate interfaces to go types.
+func WithIfaceStrategy(is IfaceStrategy) SchemaOption {
+	return func(s *Schema) {
+		s.ifaceStrategy = is
+	}
+}
+
+// WithScalars specifies a set of scalars.
+func WithScalars(scalars map[reflect.Type]string) SchemaOption {
+	return func(s *Schema) {
+		s.scalars = scalars
+	}
 }
 
 // NewSchema creates a new schema.
-func NewSchema() *Schema {
+func NewSchema(opts ...SchemaOption) *Schema {
 	schema := &Schema{
-		objects: make(map[string]*Object),
+		objects:       make(map[string]*Object),
+		ifaces:        make(map[string]*Object),
+		ifaceStrategy: IfaceGetterStrategy,
+	}
+
+	for _, o := range opts {
+		o(schema)
 	}
 
 	// Default registrations.
@@ -157,6 +185,29 @@ func FetchObjectFromKeys(f interface{}, options ...ObjectOption) ObjectOption {
 	return FetchObjectFromKeysField
 }
 
+func (s *Schema) Interface(name string, typ interface{}, options ...ObjectOption) *Object {
+	if iface, ok := s.ifaces[name]; ok {
+		if reflect.TypeOf(iface.Type) != reflect.TypeOf(typ) {
+			panic("re-registered object with different type")
+		}
+		return iface
+	}
+
+	iface := &Object{
+		Name:        name,
+		Type:        typ,
+		ServiceName: s.Name,
+		IsInterface: true,
+	}
+	s.ifaces[name] = iface
+
+	for _, opt := range options {
+		opt.apply(s, iface)
+	}
+
+	return iface
+}
+
 // Object registers a struct as a GraphQL Object in our Schema.
 // (https://facebook.github.io/graphql/June2018/#sec-Objects)
 // We'll read the fields of the struct to determine it's basic "Fields" and
@@ -179,6 +230,8 @@ func (s *Schema) Object(name string, typ interface{}, options ...ObjectOption) *
 	for _, opt := range options {
 		opt.apply(s, object)
 	}
+
+	s.updateLinks()
 
 	return object
 }
@@ -206,11 +259,14 @@ func (s *Schema) Mutation() *Object {
 // other Objects that we can resolve in our GraphQL graph.
 func (s *Schema) Build() (*graphql.Schema, error) {
 	sb := &schemaBuilder{
-		types:        make(map[reflect.Type]graphql.Type),
-		typeNames:    make(map[string]reflect.Type),
-		objects:      make(map[reflect.Type]*Object),
-		enumMappings: s.enumTypes,
-		typeCache:    make(map[reflect.Type]cachedType, 0),
+		types:         make(map[reflect.Type]graphql.Type),
+		typeNames:     make(map[string]reflect.Type),
+		objects:       make(map[reflect.Type]*Object),
+		ifaces:        make(map[reflect.Type]*Object),
+		enumMappings:  s.enumTypes,
+		typeCache:     make(map[reflect.Type]cachedType, 0),
+		ifaceStrategy: s.ifaceStrategy,
+		scalars:       mergeScalars(defaultScalars(), s.scalars),
 	}
 
 	s.Object("Query", query{})
@@ -227,6 +283,14 @@ func (s *Schema) Build() (*graphql.Schema, error) {
 		}
 
 		sb.objects[typ] = object
+	}
+
+	for _, iface := range s.ifaces {
+		typ := reflect.TypeOf(iface.Type).Elem()
+		if _, ok := sb.ifaces[typ]; ok {
+			return nil, fmt.Errorf("duplicate object for %s", typ.String())
+		}
+		sb.ifaces[typ] = iface
 	}
 
 	queryTyp, err := sb.getType(reflect.TypeOf(&query{}))
@@ -247,10 +311,24 @@ func (s *Schema) Build() (*graphql.Schema, error) {
 		objects = append(objects, tt)
 	}
 
+	var ifaces []graphql.Type
+	for t := range sb.ifaces {
+		tt, err := sb.getType(t)
+		if err != nil {
+			return nil, fmt.Errorf("ifaces: get type: %s: %w", t, err)
+		}
+		ifaces = append(ifaces, tt)
+	}
+
+	if err := sb.validateInterfaces(); err != nil {
+		return nil, err
+	}
+
 	return &graphql.Schema{
 		Query:    queryTyp,
 		Mutation: mutationTyp,
 		Objects:  objects,
+		Ifaces:   ifaces,
 	}, nil
 }
 
@@ -261,4 +339,58 @@ func (s *Schema) MustBuild() *graphql.Schema {
 		panic(err)
 	}
 	return built
+}
+
+func (s *Schema) updateLinks() {
+	for _, obj := range s.objects {
+		obj.Interfaces = s.findInterfaces(obj.Type)
+	}
+	for _, iface := range s.ifaces {
+		iface.PossibleTypes = s.findPossibleTypes(iface.Type)
+	}
+}
+
+func (s *Schema) findPossibleTypes(v interface{}) []reflect.Type {
+	iface := reflect.TypeOf(v).Elem()
+	var out []reflect.Type
+	for _, obj := range s.objects {
+		if obj.IsInterface {
+			continue
+		}
+		t := reflect.TypeOf(obj.Type)
+		if reflect.PtrTo(t).Implements(iface) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func (s *Schema) findInterfaces(v interface{}) []reflect.Type {
+	impl := reflect.PtrTo(reflect.TypeOf(v))
+	var out []reflect.Type
+	for _, obj := range s.ifaces {
+		if !obj.IsInterface {
+			continue
+		}
+		t := reflect.TypeOf(obj.Type).Elem()
+		if impl.Implements(t) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func mergeScalars(a, b map[reflect.Type]string) map[reflect.Type]string {
+	out := make(map[reflect.Type]string)
+	if a != nil {
+		for k, v := range a {
+			out[k] = v
+		}
+	}
+	if b != nil {
+		for k, v := range b {
+			out[k] = v
+		}
+	}
+	return out
 }

@@ -14,6 +14,10 @@ type Object struct {
 	Methods     Methods // Deprecated, use FieldFunc instead.
 	key         string
 	ServiceName string
+
+	IsInterface   bool
+	Interfaces    []reflect.Type
+	PossibleTypes []reflect.Type
 }
 
 type paginationObject struct {
@@ -320,7 +324,9 @@ type concurrencyArgs struct {
 // the different goroutines.
 type NumParallelInvocationsFunc func(ctx context.Context, numNodes int) int
 
-func (f NumParallelInvocationsFunc) apply(m *method) { m.ConcurrencyArgs.numParallelInvocationsFunc = f }
+func (f NumParallelInvocationsFunc) apply(m *method) {
+	m.ConcurrencyArgs.numParallelInvocationsFunc = f
+}
 
 type UseFallbackFlag func(context.Context) bool
 
